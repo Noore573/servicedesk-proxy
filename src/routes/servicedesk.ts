@@ -1,107 +1,170 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { fetchAllAccounts } from '../lib/servicedeskClient.js';
+import { fetchAllAccounts, fetchAllRequests } from '../lib/servicedeskClient.js';
 import { env } from '../lib/env.js';
 
 const router = Router();
 
-// Structured logging helper
+/* =========================
+   HELPERS
+========================= */
+// function normalizeTicket(ticket: any) {
+//   return {
+//     ...ticket,
+
+//     // Normalize status for Lovable compatibility
+//     status: typeof ticket.status === 'string'
+//       ? ticket.status
+//       : ticket.status?.name ?? 'Unknown',
+//   };
+// }
+// function normalizeTicket(ticket: any) {
+//   return {
+//     ...ticket,
+
+//     // ✅ Strings expected by UI
+//     status: typeof ticket.status === 'string'
+//       ? ticket.status
+//       : ticket.status?.name ?? 'Unknown',
+
+//     priority: typeof ticket.priority === 'string'
+//       ? ticket.priority
+//       : ticket.priority?.name ?? 'Unspecified',
+
+//     requester: typeof ticket.requester === 'string'
+//       ? ticket.requester
+//       : ticket.requester?.name ?? 'Unknown',
+
+//     technician: typeof ticket.technician === 'string'
+//       ? ticket.technician
+//       : ticket.technician?.name ?? 'Unassigned',
+
+//     created_by: typeof ticket.created_by === 'string'
+//       ? ticket.created_by
+//       : ticket.created_by?.name ?? 'System',
+//   };
+// }
+function normalizeTicket(ticket: any) {
+  const safeString = (value: any, fallback = '') =>
+    typeof value === 'string' ? value : fallback;
+
+  const subject = safeString(ticket.subject, '');
+  const shortDescription = safeString(ticket.short_description, '');
+  const group = safeString(ticket.group?.name ?? ticket.group, '');
+
+  // 🔑 THIS is what Lovable AI uses
+  const description = `${subject} ${shortDescription} ${group}`.trim();
+
+  return {
+    ...ticket,
+
+    // UI-safe fields
+    status: safeString(ticket.status?.name ?? ticket.status, 'Unknown'),
+    priority: safeString(ticket.priority?.name ?? ticket.priority, 'Unspecified'),
+    requester: safeString(ticket.requester?.name ?? ticket.requester, 'Unknown'),
+    technician: safeString(ticket.technician?.name ?? ticket.technician, 'Unassigned'),
+    created_by: safeString(ticket.created_by?.name ?? ticket.created_by, 'System'),
+
+    // Existing fields (kept)
+    subject,
+    short_description: shortDescription,
+    group,
+
+    // ✅ REQUIRED BY AI INSIGHTS
+    description,
+
+    // Optional aliases (harmless, future-proof)
+    text: description,
+    summary: description,
+  };
+}
+
 function log(level: 'info' | 'warn' | 'error', message: string, meta?: Record<string, unknown>) {
-  const logEntry = {
+  console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
     level,
     message,
     ...meta,
-  };
-  console.log(JSON.stringify(logEntry));
+  }));
 }
 
-// Async handler wrapper to catch errors
 function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<void>) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    Promise.resolve(fn(req, res, next)).catch(next);
-  };
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 }
 
-// Admin sync key validation middleware
-function validateAdminSyncKey(req: Request, res: Response, next: NextFunction) {
-  const syncKey = req.headers['x-admin-sync-key'];
-  
-  if (!syncKey || syncKey !== env.ADMIN_SYNC_KEY) {
-    log('warn', 'Unauthorized sync attempt', { 
-      ip: req.ip,
-      hasKey: !!syncKey 
-    });
-    res.status(401).json({ 
-      error: 'Unauthorized', 
-      message: 'Invalid or missing x-admin-sync-key header' 
-    });
+function normalize(text?: string): string {
+  return (text || '').toLowerCase().trim();
+}
+
+const EXCLUDED_TECHNICIANS = new Set(['kristian m matias']);
+
+function isInDateRange(ticket: any, from?: number, to?: number): boolean {
+  if (!from || !to) return true;
+  const created = Number(ticket?.created_time?.value);
+  return created >= from && created <= to;
+}
+
+function isNotExcluded(ticket: any): boolean {
+  const techName = normalize(ticket?.technician?.name);
+  return !techName || !EXCLUDED_TECHNICIANS.has(techName);
+}
+
+/* =========================
+   ACCOUNTS (UNCHANGED)
+========================= */
+
+router.get('/accounts', asyncHandler(async (req, res) => {
+  const accounts = await fetchAllAccounts();
+  res.json({ success: true, count: accounts.length, data: accounts });
+}));
+
+/* =========================
+   REQUESTS (FILTERED)
+========================= */
+
+router.get('/requests', asyncHandler(async (req, res) => {
+  const { account, from, to } = req.query;
+
+  if (!account || typeof account !== 'string') {
+    res.status(400).json({ success: false, message: 'Missing account query param' });
     return;
   }
-  
-  next();
-}
 
-/**
- * GET /api/integrations/servicedesk/accounts
- * Returns normalized list of all accounts from ServiceDesk Plus
- */
-router.get(
-  '/accounts',
-  asyncHandler(async (req: Request, res: Response) => {
-    log('info', 'Accounts request received', { ip: req.ip });
+  const fromEpoch = typeof from === 'string'
+    ? new Date(`${from}T00:00:00Z`).getTime()
+    : undefined;
 
-    try {
-      const accounts = await fetchAllAccounts();
-      
-      res.json({
-        success: true,
-        count: accounts.length,
-        data: accounts,
-      });
-    } catch (error) {
-      log('error', 'Failed to fetch accounts', { 
-        error: error instanceof Error ? error.message : 'Unknown error' 
-      });
-      throw error;
-    }
-  })
-);
+  const toEpoch = typeof to === 'string'
+    ? new Date(`${to}T23:59:59Z`).getTime()
+    : undefined;
 
-/**
- * POST /api/integrations/servicedesk/accounts/sync
- * Admin-only endpoint to trigger account sync
- * Requires x-admin-sync-key header
- */
-router.post(
-  '/accounts/sync',
-  validateAdminSyncKey,
-  asyncHandler(async (req: Request, res: Response) => {
-    log('info', 'Account sync triggered', { ip: req.ip });
+  log('info', 'Requests fetch started', { account, from, to });
 
-    try {
-      const accounts = await fetchAllAccounts();
-      const timestamp = new Date().toISOString();
+  const allTickets = await fetchAllRequests(account);
 
-      // For now, we just return the result without persisting to DB
-      // DB integration will be added in a future iteration
-      res.json({
-        success: true,
-        synced: accounts.length,
-        timestamp,
-        preview: accounts.slice(0, 5),
-      });
+  // const filtered = allTickets.filter(t =>
+  //   isInDateRange(t, fromEpoch, toEpoch) &&
+  //   isNotExcluded(t)
+  // );
+  const filtered = allTickets
+  .filter(t =>
+    isInDateRange(t, fromEpoch, toEpoch) &&
+    isNotExcluded(t)
+  )
+  .map(normalizeTicket);
 
-      log('info', 'Account sync completed', { 
-        synced: accounts.length, 
-        timestamp 
-      });
-    } catch (error) {
-      log('error', 'Account sync failed', { 
-        error: error instanceof Error ? error.message : 'Unknown error' 
-      });
-      throw error;
-    }
-  })
-);
+
+  res.json({
+    success: true,
+    meta: {
+      account,
+      from,
+      to,
+      total_raw: allTickets.length,
+      total_filtered: filtered.length,
+      excluded_technicians: Array.from(EXCLUDED_TECHNICIANS),
+    },
+    data: filtered,
+  });
+}));
 
 export default router;

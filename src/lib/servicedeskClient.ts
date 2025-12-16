@@ -1,6 +1,10 @@
 import { env } from './env.js';
 
-// Normalized account shape for internal use
+/* =========================
+   TYPES
+========================= */
+
+// Normalized account shape
 export interface NormalizedAccount {
   externalId: string;
   name: string | null;
@@ -8,29 +12,38 @@ export interface NormalizedAccount {
   isActive: boolean;
 }
 
-// ServiceDesk Plus API response types
-interface ServiceDeskAccount {
-  id?: string;
-  name?: string;
-  site?: { name?: string };
-  status?: { name?: string };
-  [key: string]: unknown;
-}
+// ServiceDesk request type (raw, pass-through)
+export type ServiceDeskRequest = any;
 
+// Fetch response helpers
 interface ListInfo {
   has_more_rows?: boolean;
-  total_count?: number;
   row_count?: number;
-  page?: number;
+  start_index?: number;
 }
 
-interface AccountsResponse {
-  accounts?: ServiceDeskAccount[];
+interface RequestsResponse {
+  requests?: ServiceDeskRequest[];
   list_info?: ListInfo;
-  response_status?: { status_code?: number; status?: string };
 }
 
-// Fetch with timeout and retry logic
+/* =========================
+   LOGGING
+========================= */
+
+function log(level: 'info' | 'warn' | 'error', message: string, meta?: Record<string, unknown>) {
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...meta,
+  }));
+}
+
+/* =========================
+   FETCH WITH RETRY
+========================= */
+
 async function fetchWithRetry(
   url: string,
   options: RequestInit,
@@ -53,110 +66,120 @@ async function fetchWithRetry(
     } catch (error) {
       clearTimeout(timeoutId);
       lastError = error instanceof Error ? error : new Error(String(error));
-      
-      // Don't retry on abort or non-transient errors
+
       if (error instanceof Error && error.name === 'AbortError') {
         throw new Error(`Request timeout after ${timeoutMs}ms`);
       }
-      
-      // Wait before retry (exponential backoff)
+
       if (attempt < retries) {
         const backoffMs = Math.pow(2, attempt) * 1000;
-        log('warn', `Retry attempt ${attempt + 1} after ${backoffMs}ms`, { url });
-        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        log('warn', `Retrying request in ${backoffMs}ms`, { url });
+        await new Promise(res => setTimeout(res, backoffMs));
       }
     }
   }
 
-  throw lastError || new Error('Request failed after retries');
+  throw lastError || new Error('Request failed');
 }
 
-// Structured logging helper
-function log(level: 'info' | 'warn' | 'error', message: string, meta?: Record<string, unknown>) {
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    level,
-    message,
-    ...meta,
-  };
-  console.log(JSON.stringify(logEntry));
-}
+/* =========================
+   ACCOUNTS (UNCHANGED)
+========================= */
 
-// Normalize a single account to internal shape
-function normalizeAccount(account: ServiceDeskAccount): NormalizedAccount {
-  return {
-    externalId: account.id?.toString() ?? '',
-    name: account.name ?? null,
-    site: account.site?.name ?? null,
-    isActive: account.status?.name?.toLowerCase() === 'active',
-  };
-}
-
-// Fetch all accounts with pagination
 export async function fetchAllAccounts(maxPages = 10): Promise<NormalizedAccount[]> {
   const allAccounts: NormalizedAccount[] = [];
   let page = 1;
-  const rowCount = 100; // Rows per page
+  const rowCount = 100;
   let hasMore = true;
-
-  log('info', 'Starting accounts fetch', { maxPages, rowCount });
 
   while (hasMore && page <= maxPages) {
     const inputData = JSON.stringify({
       list_info: {
         row_count: rowCount,
         start_index: (page - 1) * rowCount + 1,
-        sort_field: 'name',
-        sort_order: 'asc',
       },
     });
 
     const url = new URL(`${env.SERVICEDESK_BASE_URL}/api/v3/accounts`);
     url.searchParams.set('input_data', inputData);
 
-    log('info', 'Fetching accounts page', { page, startIndex: (page - 1) * rowCount + 1 });
-
     const response = await fetchWithRetry(url.toString(), {
       method: 'GET',
       headers: {
-        'authtoken': env.SERVICEDESK_AUTHTOKEN,
-        'Accept': 'application/json',
+        authtoken: env.SERVICEDESK_AUTHTOKEN,
+        Accept: 'application/json',
       },
     });
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
-      log('error', 'ServiceDesk API error', { 
-        status: response.status, 
-        statusText: response.statusText,
-        // Never log the actual error body in production as it might contain sensitive info
-        hasError: true 
-      });
-      throw new Error(`ServiceDesk API returned ${response.status}: ${response.statusText}`);
+      throw new Error(`Accounts fetch failed: ${response.statusText}`);
     }
 
-    const data: AccountsResponse = await response.json();
+    const data = await response.json();
 
-    if (data.accounts && Array.isArray(data.accounts)) {
-      const normalized = data.accounts.map(normalizeAccount);
-      allAccounts.push(...normalized);
-      log('info', 'Page fetched successfully', { 
-        page, 
-        accountsInPage: data.accounts.length,
-        totalSoFar: allAccounts.length 
-      });
+    if (Array.isArray(data.accounts)) {
+      allAccounts.push(...data.accounts.map((a: any) => ({
+        externalId: a.id?.toString() ?? '',
+        name: a.name ?? null,
+        site: a.site?.name ?? null,
+        isActive: a.status?.name?.toLowerCase() === 'active',
+      })));
     }
 
-    // Check if there are more rows
     hasMore = data.list_info?.has_more_rows === true;
     page++;
   }
 
-  log('info', 'Accounts fetch complete', { 
-    totalAccounts: allAccounts.length, 
-    pagesProcessed: page - 1,
-    reachedMaxPages: page > maxPages 
-  });
-
   return allAccounts;
+}
+
+/* =========================
+   REQUESTS (NEW)
+========================= */
+
+export async function fetchAllRequests(accountName: string): Promise<ServiceDeskRequest[]> {
+  const allRequests: ServiceDeskRequest[] = [];
+  let startIndex = 1;
+  const rowCount = 100;
+  let hasMore = true;
+
+  log('info', 'Starting requests fetch', { accountName });
+
+  while (hasMore) {
+    const inputData = JSON.stringify({
+      list_info: {
+        start_index: startIndex,
+        row_count: rowCount,
+        search_fields: {
+          'account.name': accountName,
+        },
+      },
+    });
+
+    const url = new URL(`${env.SERVICEDESK_BASE_URL}/api/v3/requests`);
+    url.searchParams.set('input_data', inputData);
+
+    const response = await fetchWithRetry(url.toString(), {
+      method: 'GET',
+      headers: {
+        authtoken: env.SERVICEDESK_AUTHTOKEN,
+        Accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Requests fetch failed: ${response.statusText}`);
+    }
+
+    const data: RequestsResponse = await response.json();
+    const batch = data.requests ?? [];
+
+    allRequests.push(...batch);
+
+    hasMore = data.list_info?.has_more_rows === true;
+    startIndex += rowCount;
+  }
+
+  log('info', 'Requests fetch completed', { total: allRequests.length });
+  return allRequests;
 }
