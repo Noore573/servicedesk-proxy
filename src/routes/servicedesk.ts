@@ -1,5 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { fetchAllAccounts, fetchAllRequests } from '../lib/servicedeskClient.js';
+import {   fetchAllAccounts,
+  fetchAllRequests,
+  fetchRequestDetails } from '../lib/servicedeskClient.js';
+
 import { env } from '../lib/env.js';
 
 const router = Router();
@@ -43,6 +46,16 @@ const router = Router();
 //       : ticket.created_by?.name ?? 'System',
 //   };
 // }
+function diffMs(a?: number, b?: number): number | null {
+  if (!a || !b) return null;
+  return Math.max(0, b - a);
+}
+
+function avg(values: number[]): number | null {
+  if (!values.length) return null;
+  return Math.round(values.reduce((a, b) => a + b, 0) / values.length);
+}
+
 function normalizeTicket(ticket: any) {
   const safeString = (value: any, fallback = '') =>
     typeof value === 'string' ? value : fallback;
@@ -121,6 +134,51 @@ router.get('/accounts', asyncHandler(async (req, res) => {
    REQUESTS (FILTERED)
 ========================= */
 
+// router.get('/requests', asyncHandler(async (req, res) => {
+//   const { account, from, to } = req.query;
+
+//   if (!account || typeof account !== 'string') {
+//     res.status(400).json({ success: false, message: 'Missing account query param' });
+//     return;
+//   }
+
+//   const fromEpoch = typeof from === 'string'
+//     ? new Date(`${from}T00:00:00Z`).getTime()
+//     : undefined;
+
+//   const toEpoch = typeof to === 'string'
+//     ? new Date(`${to}T23:59:59Z`).getTime()
+//     : undefined;
+
+//   log('info', 'Requests fetch started', { account, from, to });
+
+//   const allTickets = await fetchAllRequests(account);
+
+//   // const filtered = allTickets.filter(t =>
+//   //   isInDateRange(t, fromEpoch, toEpoch) &&
+//   //   isNotExcluded(t)
+//   // );
+//   const filtered = allTickets
+//   .filter(t =>
+//     isInDateRange(t, fromEpoch, toEpoch) &&
+//     isNotExcluded(t)
+//   )
+//   .map(normalizeTicket);
+
+
+//   res.json({
+//     success: true,
+//     meta: {
+//       account,
+//       from,
+//       to,
+//       total_raw: allTickets.length,
+//       total_filtered: filtered.length,
+//       excluded_technicians: Array.from(EXCLUDED_TECHNICIANS),
+//     },
+//     data: filtered,
+//   });
+// }));
 router.get('/requests', asyncHandler(async (req, res) => {
   const { account, from, to } = req.query;
 
@@ -141,17 +199,35 @@ router.get('/requests', asyncHandler(async (req, res) => {
 
   const allTickets = await fetchAllRequests(account);
 
-  // const filtered = allTickets.filter(t =>
-  //   isInDateRange(t, fromEpoch, toEpoch) &&
-  //   isNotExcluded(t)
-  // );
-  const filtered = allTickets
-  .filter(t =>
+  const filtered = allTickets.filter(t =>
     isInDateRange(t, fromEpoch, toEpoch) &&
     isNotExcluded(t)
-  )
-  .map(normalizeTicket);
+  );
 
+  // =========================
+  // SLA METRICS (NEW)
+  // =========================
+  const responseTimes: number[] = [];
+  const resolutionTimes: number[] = [];
+
+  for (const ticket of filtered) {
+    const details = await fetchRequestDetails(ticket.id?.toString());
+    if (!details) continue;
+
+    const created = Number(details.created_time?.value);
+    const responded = Number(details.responded_time?.value);
+    const resolved =
+      Number(details.resolved_time?.value) ||
+      Number(details.completed_time?.value);
+
+    const responseMs = diffMs(created, responded);
+    const resolutionMs = diffMs(created, resolved);
+
+    if (responseMs !== null) responseTimes.push(responseMs);
+    if (resolutionMs !== null) resolutionTimes.push(resolutionMs);
+  }
+
+  const normalized = filtered.map(normalizeTicket);
 
   res.json({
     success: true,
@@ -160,11 +236,16 @@ router.get('/requests', asyncHandler(async (req, res) => {
       from,
       to,
       total_raw: allTickets.length,
-      total_filtered: filtered.length,
+      total_filtered: normalized.length,
       excluded_technicians: Array.from(EXCLUDED_TECHNICIANS),
+
+      // ✅ NEW KPIs
+      avg_response_time_ms: avg(responseTimes),
+      avg_resolution_time_ms: avg(resolutionTimes),
     },
-    data: filtered,
+    data: normalized,
   });
 }));
+
 
 export default router;

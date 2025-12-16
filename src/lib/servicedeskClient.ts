@@ -183,3 +183,29 @@ export async function fetchAllRequests(accountName: string): Promise<ServiceDesk
   log('info', 'Requests fetch completed', { total: allRequests.length });
   return allRequests;
 }
+/* =========================
+   REQUEST DETAILS (NEW)
+========================= */
+
+export async function fetchRequestDetails(
+  requestId: string
+): Promise<ServiceDeskRequest | null> {
+  const url = `${env.SERVICEDESK_BASE_URL}/api/v3/requests/${requestId}`;
+
+  const response = await fetchWithRetry(url, {
+    method: 'GET',
+    headers: {
+      authtoken: env.SERVICEDESK_AUTHTOKEN,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    log('warn', 'Failed to fetch request details', { requestId });
+    return null;
+  }
+
+  const data = await response.json();
+  return data.request ?? null;
+}
+
